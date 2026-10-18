@@ -24,6 +24,7 @@ numpy>=1.26
 # deployment able to switch provider by changing a secret, with no code change.
 groq>=0.11
 google-genai>=1.0
+pypdf>=5.0
 
 # NOTE: gradio was previously pinned here. It is not imported anywhere in this
 # project (verified with a repo-wide search) and only added build weight and
