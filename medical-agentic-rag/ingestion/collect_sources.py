@@ -2,11 +2,7 @@
 """Load and normalize source documents for the CKD Agentic RAG pipeline.
 
 Supports TXT, Markdown, and PDF files.
-Markdown front matter supports simple key: value metadata.
-
-Documents are marked as "unverified" unless their metadata explicitly
-sets a data_status. A metadata label alone does not establish that a
-medical source is clinically authoritative.
+Unknown provenance defaults to 'unknown', matching agent.state.DataStatus.
 """
 
 from __future__ import annotations
@@ -26,9 +22,14 @@ logger = logging.getLogger(__name__)
 FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*\n", re.DOTALL)
 
 ALLOWED_DATA_STATUSES = {
-    "unverified",
     "demo",
-    "verified",
+    "guideline",
+    "regulatory",
+    "reference",
+    "literature",
+    "licensed",
+    "live",
+    "unknown",
 }
 
 
@@ -45,7 +46,7 @@ class RawDocument:
     publication_date: str | None = None
     document_type: str | None = None
     evidence_level: str | None = None
-    data_status: str = "unverified"
+    data_status: str = "unknown"
     retrieved_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -53,25 +54,15 @@ class RawDocument:
 
 
 def normalize_text(text: str) -> str:
-    """Normalize Unicode, remove control characters, and trim whitespace."""
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = "".join(
-        char
-        for char in text
-        if char in "\n\t" or char >= " "
-    )
+    text = "".join(char for char in text if char in "\n\t" or char >= " ")
     text = re.sub(r"[ \t]+(\n)", r"\1", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
 def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
-    """Parse a simple Markdown front-matter block.
-
-    This is intentionally not a full YAML parser. Nested objects, lists,
-    and complex YAML values are not supported.
-    """
     match = FRONT_MATTER_RE.match(text)
     if not match:
         return {}, text
@@ -88,7 +79,6 @@ def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
         key = key.strip()
         value = value.strip()
 
-        # Remove matching surrounding quotes only.
         if (
             len(value) >= 2
             and value[0] == value[-1]
@@ -109,14 +99,11 @@ def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
 
 
 def document_id_for(path: Path, text: str) -> str:
-    """Create a stable document ID from its filename and content."""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
     return f"{path.stem}-{digest}"
 
 
 class BaseLoader(ABC):
-    """Interface for loaders that support particular file extensions."""
-
     extensions: tuple[str, ...] = ()
 
     def can_load(self, path: Path) -> bool:
@@ -142,12 +129,7 @@ class PdfLoader(BaseLoader):
     extensions = (".pdf",)
 
     def load_text(self, path: Path) -> str:
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            raise RuntimeError(
-                "PDF ingestion requires pypdf. Add pypdf to requirements.txt."
-            ) from exc
+        from pypdf import PdfReader
 
         reader = PdfReader(str(path))
         pages: list[str] = []
@@ -174,7 +156,6 @@ DEFAULT_LOADERS: tuple[BaseLoader, ...] = (
 
 
 def _first_heading(text: str) -> str | None:
-    """Return the first Markdown heading, if present near the beginning."""
     for line in text.splitlines():
         stripped = line.strip()
 
@@ -184,26 +165,24 @@ def _first_heading(text: str) -> str | None:
         if stripped.startswith("#"):
             return stripped.lstrip("#").strip() or None
 
-        # Don't treat an arbitrary first sentence as a heading.
         return None
 
     return None
 
 
 def _safe_data_status(value: Any, path: Path) -> str:
-    """Normalize status metadata and default unknown values to unverified."""
     if not isinstance(value, str):
-        return "unverified"
+        return "unknown"
 
     status = value.strip().lower()
 
     if status not in ALLOWED_DATA_STATUSES:
         logger.warning(
-            "Unknown data_status %r in %s; using 'unverified'",
+            "Unknown data_status %r in %s; using 'unknown'",
             value,
             path.name,
         )
-        return "unverified"
+        return "unknown"
 
     return status
 
@@ -212,7 +191,6 @@ def load_document(
     path: Path,
     loaders: Iterable[BaseLoader] = DEFAULT_LOADERS,
 ) -> RawDocument | None:
-    """Load a supported file into a normalized RawDocument."""
     loader = next((item for item in loaders if item.can_load(path)), None)
 
     if loader is None:
@@ -256,7 +234,7 @@ def load_document(
         document_type=metadata.get("document_type"),
         evidence_level=metadata.get("evidence_level"),
         data_status=_safe_data_status(
-            metadata.get("data_status", "unverified"),
+            metadata.get("data_status", "unknown"),
             path,
         ),
         extra={
@@ -271,13 +249,8 @@ def collect_documents(
     directory: Path,
     loaders: Iterable[BaseLoader] = DEFAULT_LOADERS,
 ) -> list[RawDocument]:
-    """Recursively collect supported, non-empty documents from a directory."""
-    if not directory.exists():
-        logger.warning("Source directory does not exist: %s", directory)
-        return []
-
-    if not directory.is_dir():
-        logger.warning("Source path is not a directory: %s", directory)
+    if not directory.exists() or not directory.is_dir():
+        logger.warning("Source directory is missing or invalid: %s", directory)
         return []
 
     documents: list[RawDocument] = []
