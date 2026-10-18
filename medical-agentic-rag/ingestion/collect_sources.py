@@ -1,9 +1,12 @@
-"""Source collection: load raw documents from disk into normalised records.
 
-Supports TXT, Markdown and PDF through a small loader abstraction. Front-matter
-metadata (``---`` YAML-style block at the top of a Markdown file) is parsed with
-a minimal scalar parser so no extra dependency is required; absent fields stay
-``None`` and are never invented.
+"""Load and normalize source documents for the CKD Agentic RAG pipeline.
+
+Supports TXT, Markdown, and PDF files.
+Markdown front matter supports simple key: value metadata.
+
+Documents are marked as "unverified" unless their metadata explicitly
+sets a data_status. A metadata label alone does not establish that a
+medical source is clinically authoritative.
 """
 
 from __future__ import annotations
@@ -20,12 +23,18 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-FRONT_MATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*\n", re.DOTALL)
+
+ALLOWED_DATA_STATUSES = {
+    "unverified",
+    "demo",
+    "verified",
+}
 
 
 @dataclass(slots=True)
 class RawDocument:
-    """A loaded source document prior to chunking."""
+    """A loaded source document before chunking."""
 
     document_id: str
     text: str
@@ -36,7 +45,7 @@ class RawDocument:
     publication_date: str | None = None
     document_type: str | None = None
     evidence_level: str | None = None
-    data_status: str = "demo"
+    data_status: str = "unverified"
     retrieved_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -44,48 +53,69 @@ class RawDocument:
 
 
 def normalize_text(text: str) -> str:
-    """Unicode-normalise, strip control chars, collapse blank-line runs."""
+    """Normalize Unicode, remove control characters, and trim whitespace."""
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ch >= " ")
+    text = "".join(
+        char
+        for char in text
+        if char in "\n\t" or char >= " "
+    )
     text = re.sub(r"[ \t]+(\n)", r"\1", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
 def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
-    """Extract a simple ``key: value`` front-matter block.
+    """Parse a simple Markdown front-matter block.
 
-    Returns ``(metadata, body)``. Values ``null``/``none``/``~`` become ``None``.
+    This is intentionally not a full YAML parser. Nested objects, lists,
+    and complex YAML values are not supported.
     """
     match = FRONT_MATTER_RE.match(text)
     if not match:
         return {}, text
+
     metadata: dict[str, Any] = {}
+
     for line in match.group(1).splitlines():
         line = line.strip()
+
         if not line or line.startswith("#") or ":" not in line:
             continue
+
         key, _, value = line.partition(":")
-        value = value.strip().strip('"').strip("'")
+        key = key.strip()
+        value = value.strip()
+
+        # Remove matching surrounding quotes only.
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+
         lowered = value.lower()
+
         if lowered in {"null", "none", "~", ""}:
-            metadata[key.strip()] = None
+            metadata[key] = None
         elif lowered in {"true", "false"}:
-            metadata[key.strip()] = lowered == "true"
+            metadata[key] = lowered == "true"
         else:
-            metadata[key.strip()] = value
-    return metadata, text[match.end() :]
+            metadata[key] = value
+
+    return metadata, text[match.end():]
 
 
 def document_id_for(path: Path, text: str) -> str:
-    """Stable id derived from filename + content hash (re-ingestion is idempotent)."""
+    """Create a stable document ID from its filename and content."""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
     return f"{path.stem}-{digest}"
 
 
 class BaseLoader(ABC):
-    """Loader interface: claim a file extension, return raw text."""
+    """Interface for loaders that support particular file extensions."""
 
     extensions: tuple[str, ...] = ()
 
@@ -94,7 +124,7 @@ class BaseLoader(ABC):
 
     @abstractmethod
     def load_text(self, path: Path) -> str:
-        """Return the raw text of ``path``."""
+        """Read a file and return its raw text."""
 
 
 class TextLoader(BaseLoader):
@@ -113,81 +143,157 @@ class PdfLoader(BaseLoader):
 
     def load_text(self, path: Path) -> str:
         try:
-            from pypdf import PdfReader  # noqa: PLC0415
-        except ImportError as exc:  # pragma: no cover - depends on env
-            raise RuntimeError("pypdf is required to ingest PDF files") from exc
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise RuntimeError(
+                "PDF ingestion requires pypdf. Add pypdf to requirements.txt."
+            ) from exc
+
         reader = PdfReader(str(path))
-        pages = []
-        for page in reader.pages:
+        pages: list[str] = []
+
+        for page_number, page in enumerate(reader.pages, start=1):
             try:
                 pages.append(page.extract_text() or "")
-            except Exception:  # noqa: BLE001 - one bad page must not kill ingestion
-                logger.warning("Failed to extract a page from %s", path.name, exc_info=True)
+            except Exception:
+                logger.warning(
+                    "Could not extract text from page %s of %s",
+                    page_number,
+                    path.name,
+                    exc_info=True,
+                )
+
         return "\n\n".join(pages)
 
 
-DEFAULT_LOADERS: tuple[BaseLoader, ...] = (TextLoader(), MarkdownLoader(), PdfLoader())
+DEFAULT_LOADERS: tuple[BaseLoader, ...] = (
+    TextLoader(),
+    MarkdownLoader(),
+    PdfLoader(),
+)
 
 
 def _first_heading(text: str) -> str | None:
+    """Return the first Markdown heading, if present near the beginning."""
     for line in text.splitlines():
         stripped = line.strip()
+
+        if not stripped:
+            continue
+
         if stripped.startswith("#"):
             return stripped.lstrip("#").strip() or None
-        if stripped:
-            return None
+
+        # Don't treat an arbitrary first sentence as a heading.
+        return None
+
     return None
 
 
-def load_document(path: Path, loaders: Iterable[BaseLoader] = DEFAULT_LOADERS) -> RawDocument | None:
-    """Load a single file into a :class:`RawDocument` (``None`` if unsupported/empty)."""
-    loader = next((ld for ld in loaders if ld.can_load(path)), None)
+def _safe_data_status(value: Any, path: Path) -> str:
+    """Normalize status metadata and default unknown values to unverified."""
+    if not isinstance(value, str):
+        return "unverified"
+
+    status = value.strip().lower()
+
+    if status not in ALLOWED_DATA_STATUSES:
+        logger.warning(
+            "Unknown data_status %r in %s; using 'unverified'",
+            value,
+            path.name,
+        )
+        return "unverified"
+
+    return status
+
+
+def load_document(
+    path: Path,
+    loaders: Iterable[BaseLoader] = DEFAULT_LOADERS,
+) -> RawDocument | None:
+    """Load a supported file into a normalized RawDocument."""
+    loader = next((item for item in loaders if item.can_load(path)), None)
+
     if loader is None:
-        logger.debug("No loader for %s", path.name)
+        logger.debug("No loader available for %s", path.name)
         return None
+
     try:
-        raw = loader.load_text(path)
-    except Exception as exc:  # noqa: BLE001
+        raw_text = loader.load_text(path)
+    except Exception as exc:
         logger.error("Failed to load %s: %s", path, exc)
         return None
 
-    metadata, body = parse_front_matter(raw)
+    metadata, body = parse_front_matter(raw_text)
     body = normalize_text(body)
+
     if not body:
         logger.warning("Skipping empty document: %s", path.name)
         return None
+
+    known_metadata = {
+        "title",
+        "source",
+        "url",
+        "publication_date",
+        "document_type",
+        "evidence_level",
+        "data_status",
+    }
+
+    title = metadata.get("title") or _first_heading(body) or path.stem
+    source = metadata.get("source") or "local corpus"
 
     return RawDocument(
         document_id=document_id_for(path, body),
         text=body,
         path=path,
-        title=metadata.get("title") or _first_heading(body) or path.stem,
-        source=metadata.get("source") or "local corpus",
+        title=str(title),
+        source=str(source),
         url=metadata.get("url"),
         publication_date=metadata.get("publication_date"),
         document_type=metadata.get("document_type"),
         evidence_level=metadata.get("evidence_level"),
-        data_status=metadata.get("data_status") or "demo",
-        extra={k: v for k, v in metadata.items() if k not in {
-            "title", "source", "url", "publication_date", "document_type",
-            "evidence_level", "data_status",
-        }},
+        data_status=_safe_data_status(
+            metadata.get("data_status", "unverified"),
+            path,
+        ),
+        extra={
+            key: value
+            for key, value in metadata.items()
+            if key not in known_metadata
+        },
     )
 
 
 def collect_documents(
-    directory: Path, loaders: Iterable[BaseLoader] = DEFAULT_LOADERS
+    directory: Path,
+    loaders: Iterable[BaseLoader] = DEFAULT_LOADERS,
 ) -> list[RawDocument]:
-    """Recursively load every supported document under ``directory``."""
+    """Recursively collect supported, non-empty documents from a directory."""
     if not directory.exists():
         logger.warning("Source directory does not exist: %s", directory)
         return []
+
+    if not directory.is_dir():
+        logger.warning("Source path is not a directory: %s", directory)
+        return []
+
     documents: list[RawDocument] = []
+
     for path in sorted(directory.rglob("*")):
         if not path.is_file() or path.name.startswith("."):
             continue
+
         document = load_document(path, loaders)
+
         if document is not None:
             documents.append(document)
-    logger.info("Collected %d document(s) from %s", len(documents), directory)
+
+    logger.info(
+        "Collected %d document(s) from %s",
+        len(documents),
+        directory,
+    )
     return documents
