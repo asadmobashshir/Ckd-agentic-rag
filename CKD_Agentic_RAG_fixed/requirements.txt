@@ -1,0 +1,4 @@
+# Streamlit Community Cloud resolves requirements from the repository root.
+# The canonical list lives next to the application; this include keeps the two
+# from drifting apart.
+-r medical-agentic-rag/requirements.txt

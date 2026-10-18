@@ -1,0 +1,13 @@
+# Optional semantic embedding backend.
+#
+# WARNING: pulls in PyTorch + torchvision (~2 GB uncompressed). This commonly
+# exceeds the Streamlit Community Cloud free-tier build limits. Append these
+# lines to requirements.txt only if you are deploying somewhere with more
+# memory and build time, or running locally.
+#
+#   pip install -r requirements-embeddings.txt
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+torchvision>=0.17
+sentence-transformers>=3.0

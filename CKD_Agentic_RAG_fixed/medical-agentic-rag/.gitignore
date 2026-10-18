@@ -1,0 +1,33 @@
+# Secrets - never commit
+.env
+*.key
+.streamlit/secrets.toml
+secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated data (rebuild with: python -m ingestion.run_ingestion --reset)
+data/processed/
+data/structured/*.db
+data/structured/*.db-journal
+!data/structured/demo_drug_data.json
+
+# Local model caches
+.cache/
+models/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
