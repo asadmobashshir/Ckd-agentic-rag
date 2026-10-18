@@ -1,4 +1,5 @@
-"""Semantic search over the curated local medical knowledge base."""
+
+"""Semantic and lexical search over the curated local medical knowledge base."""
 
 from __future__ import annotations
 
@@ -16,23 +17,92 @@ from stores.vector_store import BaseVectorStore, build_vector_store
 
 logger = logging.getLogger(__name__)
 
+# These are the allowed values in agent.state.DataStatus.
+ALLOWED_DATA_STATUSES = {
+    "demo",
+    "guideline",
+    "regulatory",
+    "reference",
+    "literature",
+    "licensed",
+    "live",
+    "unknown",
+}
+
+# Convert legacy or incompatible values into the accepted vocabulary.
+DATA_STATUS_ALIASES = {
+    "unverified": "unknown",
+    "verified": "unknown",
+    "": "unknown",
+    "none": "unknown",
+    "null": "unknown",
+}
+
+
+def normalize_data_status(value: Any) -> str:
+    """Return a data status accepted by the Evidence model."""
+    if value is None:
+        return "unknown"
+
+    status = str(value).strip().lower()
+    status = DATA_STATUS_ALIASES.get(status, status)
+
+    if status not in ALLOWED_DATA_STATUSES:
+        logger.warning(
+            "Unknown data_status %r in retrieved metadata; using 'unknown'",
+            value,
+        )
+        return "unknown"
+
+    return status
+
+
+def normalize_trust_tier(value: Any) -> TrustTier:
+    """Convert stored trust-tier metadata to the TrustTier enum safely."""
+    if isinstance(value, TrustTier):
+        return value
+
+    if value is None:
+        return TrustTier("UNKNOWN")
+
+    status = str(value).strip().upper()
+
+    try:
+        return TrustTier(status)
+    except ValueError:
+        logger.warning(
+            "Unknown trust_tier %r in retrieved metadata; using UNKNOWN",
+            value,
+        )
+        return TrustTier("UNKNOWN")
+
 
 class VectorSearchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(min_length=2, max_length=512, description="Search query text.")
-    top_k: int = Field(default=5, ge=1, le=20, description="Number of chunks to return.")
+    query: str = Field(
+        min_length=2,
+        max_length=512,
+        description="Search query text.",
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of chunks to return.",
+    )
 
 
 class VectorSearchTool(BaseTool):
-    """Retrieve the most similar chunks from the curated local corpus."""
+    """Retrieve relevant chunks from the curated local medical corpus."""
 
     name: ClassVar[str] = "vector_search"
     description: ClassVar[str] = (
-        "Search the curated local medical knowledge base for passages relevant to a "
-        "query. Use for general medical/clinical background, mechanisms, indications, "
-        "cautions and any question the local corpus may cover. Returns text chunks "
-        "with full source provenance."
+        "Search the curated local medical knowledge base for relevant passages. "
+        "Use for general medical background, mechanisms, indications, cautions, "
+        "and questions the local corpus may cover. Returns text chunks with "
+        "source provenance. Retrieved content is evidence, not a substitute "
+        "for clinical judgement."
     )
     args_model: ClassVar[type[BaseModel]] = VectorSearchArgs
 
@@ -62,106 +132,163 @@ class VectorSearchTool(BaseTool):
 
     @property
     def lexical(self) -> BM25Index:
-        """BM25 index over the same chunks, rebuilt when the store changes size."""
+        """Build BM25 over stored chunks; rebuild when the store size changes."""
         count = self.store.count()
+
         if self._lexical is None or self._lexical_size != count:
             self._lexical = BM25Index(self.store.list_payloads())
             self._lexical_size = count
+
         return self._lexical
 
-    def run(self, args: BaseModel) -> tuple[list[Evidence], dict[str, Any]]:
-        assert isinstance(args, VectorSearchArgs)
-        top_k = min(args.top_k, self._settings.top_k * 2)
+    def run(
+        self,
+        args: BaseModel,
+    ) -> tuple[list[Evidence], dict[str, Any]]:
+        if not isinstance(args, VectorSearchArgs):
+            args = VectorSearchArgs.model_validate(args.model_dump())
 
-        if self.store.count() == 0:
+        top_k = min(args.top_k, self._settings.top_k * 2)
+        store_count = self.store.count()
+
+        if store_count == 0:
             return [], {
                 "hits": 0,
                 "index_empty": True,
                 "message": (
-                    "The vector index is empty. Run `python -m ingestion.run_ingestion` "
-                    "before querying."
+                    "The vector index is empty. Build the index using the "
+                    "project's ingestion pipeline before querying."
                 ),
             }
 
-        # ---- hybrid retrieval: dense similarity fused with BM25 ------------
-        # Dense-only retrieval failed on short keyword questions (a "CKD staging"
-        # query returned the medicines document), so both retrievers run and their
-        # RANKS are fused. Ranks fuse safely; raw cosine and BM25 scores do not.
+        # Retrieve candidates from dense search and BM25.
         candidate_pool = max(top_k * 3, 10)
 
-        vector = self.embedder.embed_query(args.query)
-        dense_hits = self.store.search(vector, top_k=candidate_pool)
-        dense_by_id = {h.payload.get("chunk_id") or h.id: h for h in dense_hits}
-        dense_ranking = [h.payload.get("chunk_id") or h.id for h in dense_hits]
+        query_vector = self.embedder.embed_query(args.query)
+        dense_hits = self.store.search(
+            query_vector,
+            top_k=candidate_pool,
+        )
 
-        lexical_hits = self.lexical.search(args.query, top_k=candidate_pool)
+        dense_by_id = {
+            hit.payload.get("chunk_id") or hit.id: hit
+            for hit in dense_hits
+        }
+        dense_ranking = [
+            hit.payload.get("chunk_id") or hit.id
+            for hit in dense_hits
+        ]
+
+        lexical_hits = self.lexical.search(
+            args.query,
+            top_k=candidate_pool,
+        )
+
         lexical_by_id: dict[str, dict[str, Any]] = {}
         lexical_ranking: list[str] = []
         lexical_scores: dict[str, float] = {}
+
         for payload, score in lexical_hits:
             key = payload.get("chunk_id") or payload.get("_record_id")
-            if not key:
+
+            if key is None:
                 continue
+
+            key = str(key)
             lexical_by_id[key] = payload
             lexical_ranking.append(key)
-            lexical_scores[key] = score
+            lexical_scores[key] = float(score)
 
-        fused = reciprocal_rank_fusion([dense_ranking, lexical_ranking])
-
-        # A chunk qualifies if either retriever found it credible: it cleared the
-        # dense similarity floor, or BM25 matched real query terms in it. Requiring
-        # both would reinstate the dense-only failure this fusion exists to fix.
-        ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+        fused = reciprocal_rank_fusion(
+            [dense_ranking, lexical_ranking]
+        )
+        ordered = sorted(
+            fused.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
 
         evidence: list[Evidence] = []
+
         for key, fused_score in ordered:
             if len(evidence) >= top_k:
                 break
+
             hit = dense_by_id.get(key)
-            payload = hit.payload if hit is not None else lexical_by_id.get(key)
+            payload = (
+                hit.payload
+                if hit is not None
+                else lexical_by_id.get(key)
+            )
+
             if not payload:
                 continue
+
             dense_score = float(hit.score) if hit is not None else 0.0
             lexical_score = lexical_scores.get(key, 0.0)
-            if dense_score < self._settings.min_similarity and lexical_score <= 0.0:
+
+            # Keep a result if either retrieval method finds a usable match.
+            if (
+                dense_score < self._settings.min_similarity
+                and lexical_score <= 0.0
+            ):
                 continue
+
             text = payload.get("text")
-            if not text:
+            if not isinstance(text, str) or not text.strip():
                 continue
-            evidence.append(
-                Evidence(
+
+            data_status = normalize_data_status(
+                payload.get("data_status", "unknown")
+            )
+            trust_tier = normalize_trust_tier(
+                payload.get("trust_tier", "UNKNOWN")
+            )
+
+            try:
+                item = Evidence(
                     text=text,
                     source=payload.get("source") or "local corpus",
                     title=payload.get("title"),
                     url=payload.get("url"),
                     publication_date=payload.get("publication_date"),
-                    retrieved_at=payload.get("retrieved_at") or utc_now_iso(),
+                    retrieved_at=(
+                        payload.get("retrieved_at") or utc_now_iso()
+                    ),
                     evidence_level=payload.get("evidence_level"),
                     document_type=payload.get("document_type"),
                     section=payload.get("section"),
                     document_id=payload.get("document_id"),
                     chunk_id=payload.get("chunk_id"),
-                    # Reported score stays the dense similarity so the confidence
-                    # heuristic keeps interpreting it on its original scale.
+                    # Preserve the dense score's existing scale.
                     score=round(dense_score, 4),
-                    trust_tier=TrustTier(payload.get("trust_tier", "UNKNOWN")),
-                    data_status=payload.get("data_status", "unknown"),
+                    trust_tier=trust_tier,
+                    data_status=data_status,
                     extra={
                         "retrieval": "hybrid_vector_bm25",
                         "file_name": payload.get("file_name"),
-                        "fused_score": round(fused_score, 5),
+                        "fused_score": round(float(fused_score), 5),
                         "lexical_score": round(lexical_score, 4),
-                        # Whether `score` is a semantic cosine or a lexical-hash
-                        # cosine. The two live on different scales, so anything
-                        # interpreting `score` must know which it is holding.
-                        "semantic_embeddings": bool(self.embedder.describe().get("semantic")),
+                        "semantic_embeddings": bool(
+                            self.embedder.describe().get("semantic")
+                        ),
                         "matched_by": (
-                            "both" if (hit is not None and lexical_score > 0)
-                            else ("dense" if hit is not None else "lexical")
+                            "both"
+                            if hit is not None and lexical_score > 0
+                            else "dense"
+                            if hit is not None
+                            else "lexical"
                         ),
                     },
                 )
-            )
+            except Exception:
+                logger.exception(
+                    "Could not create Evidence for retrieved chunk %s",
+                    key,
+                )
+                continue
+
+            evidence.append(item)
 
         return evidence, {
             "hits": len(evidence),
