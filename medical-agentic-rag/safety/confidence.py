@@ -26,7 +26,13 @@ import re
 from datetime import datetime, timezone
 from typing import Sequence
 
-from agent.state import ConfidenceLevel, ConfidenceReport, Evidence, VerificationResult
+from agent.state import (
+    ConfidenceLevel,
+    ConfidenceReport,
+    Evidence,
+    VerificationResult,
+    is_synthetic,
+)
 from safety.source_trust import tier_weight
 
 WEIGHTS = {
@@ -196,7 +202,7 @@ def compute_confidence(
     score = sum(WEIGHTS[name] * value for name, value in factors.items())
 
     if demo_data_only is None:
-        demo_data_only = bool(evidence) and all(e.data_status == "demo" for e in evidence)
+        demo_data_only = bool(evidence) and all(is_synthetic(e.data_status) for e in evidence)
     if demo_data_only:
         score *= 0.75
         report.rationale.append(

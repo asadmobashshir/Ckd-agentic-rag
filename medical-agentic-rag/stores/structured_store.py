@@ -6,7 +6,15 @@ Every row carries ``data_status``; the demo fixture sets it to ``"demo"`` and
 that value is propagated all the way to the user-visible answer.
 
 A real deployment must replace ``data/structured/demo_drug_data.json`` with a
-properly licensed and validated source and set ``data_status='licensed'``.
+properly licensed and validated source and set ``data_status`` to the matching
+provenance - ``'regulatory'`` for FDA labelling, ``'licensed'`` for a
+commercial dataset. The accepted values are the ``DataStatus`` vocabulary in
+``agent/state.py``; see ``docs/REAL_DATA_SOURCES.md`` for candidate sources and
+their licence terms.
+
+Drug-drug interaction data is the highest-risk content in this project and has
+no good free replacement. A clearly-labelled demo fixture is more defensible
+than an unvalidated scrape.
 """
 
 from __future__ import annotations

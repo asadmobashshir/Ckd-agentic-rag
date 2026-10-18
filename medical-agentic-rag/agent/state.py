@@ -23,6 +23,41 @@ def new_request_id() -> str:
     return f"req_{uuid.uuid4().hex[:16]}"
 
 
+#: Provenance of a piece of evidence. This records WHERE the text came from; it
+#: is not a quality score and never implies the content is correct.
+#:
+#: ``demo``        synthetic demonstration text written for this repository
+#: ``guideline``   curated clinical practice guideline (e.g. KDIGO, NICE)
+#: ``regulatory``  regulatory product labelling (e.g. FDA SPL / DailyMed)
+#: ``reference``   public-health reference material (e.g. NIDDK, MedlinePlus)
+#: ``literature``  peer-reviewed literature (e.g. PubMed / PMC)
+#: ``licensed``    licensed third-party dataset
+#: ``live``        fetched from the network at query time
+#: ``unknown``     unclassified
+DataStatus = Literal[
+    "demo",
+    "guideline",
+    "regulatory",
+    "reference",
+    "literature",
+    "licensed",
+    "live",
+    "unknown",
+]
+
+#: Statuses whose text was *authored for demonstration* rather than drawn from a
+#: real source. Confidence scoring and the citation footer key off this set, so
+#: replacing the demo corpus with real documents lifts the synthetic-data penalty
+#: because the evidence genuinely stopped being synthetic - not because a
+#: threshold was lowered.
+SYNTHETIC_DATA_STATUSES: frozenset[str] = frozenset({"demo"})
+
+
+def is_synthetic(data_status: str) -> bool:
+    """Whether this provenance marks text as demonstration-only content."""
+    return data_status in SYNTHETIC_DATA_STATUSES
+
+
 class TrustTier(str, Enum):
     """Configurable retrieval-prioritisation heuristic - NOT a truth guarantee."""
 
@@ -77,7 +112,7 @@ class Evidence(BaseModel):
     chunk_id: str | None = None
     score: float | None = None
     trust_tier: TrustTier = TrustTier.UNKNOWN
-    data_status: Literal["demo", "live", "unknown"] = "unknown"
+    data_status: DataStatus = "unknown"
     extra: dict[str, Any] = Field(default_factory=dict)
 
     def short_label(self) -> str:

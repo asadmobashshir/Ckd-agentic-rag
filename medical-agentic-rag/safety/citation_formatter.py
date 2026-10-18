@@ -18,7 +18,7 @@ import logging
 import re
 from typing import Sequence
 
-from agent.state import Citation, Evidence
+from agent.state import Citation, Evidence, is_synthetic
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ def format_answer(
         lines = "\n".join(citation.render() for citation in citations)
         cleaned = f"{cleaned.rstrip()}\n\nSources:\n{lines}"
 
-        if any(c.data_status == "demo" for c in citations):
+        if any(is_synthetic(c.data_status) for c in citations):
             cleaned += (
                 "\n\nNote: sources marked DEMO come from the bundled demonstration "
                 "dataset and are not a validated medical knowledge source."

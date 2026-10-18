@@ -111,6 +111,17 @@ Confidence therefore calibrates per backend, with the mapping documented in
 are disabled rather than claiming "similarity was weak". Scores are not inflated
 — lexical strength is capped below a semantic match on purpose.
 
+## Using real data instead of the demo corpus
+
+The bundled corpus is synthetic. `docs/REAL_DATA_SOURCES.md` lists real CKD
+sources that can replace it (NIDDK, MedlinePlus, CDC, KDIGO, NICE, openFDA
+labelling, PMC open-access), what each licence actually permits, the front
+matter to write, and the three things that break when you swap it in.
+
+Provenance is a closed vocabulary — `demo`, `guideline`, `regulatory`,
+`reference`, `literature`, `licensed`, `live`, `unknown` — so a typo fails
+loudly and unlabelled content stays `demo`.
+
 ## Testing
 
 ```bash
