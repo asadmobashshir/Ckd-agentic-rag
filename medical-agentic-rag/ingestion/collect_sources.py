@@ -4,9 +4,9 @@
 Supports TXT, Markdown, and PDF files.
 Markdown front matter supports simple key: value metadata.
 
-Documents default to "unverified" unless their metadata explicitly
-sets an allowed data_status. A metadata label alone does not prove
-that a medical source is clinically authoritative.
+Documents default to "unverified" unless their metadata explicitly provides
+an allowed data_status. A metadata label alone does not establish clinical
+authority.
 """
 
 from __future__ import annotations
@@ -33,6 +33,16 @@ ALLOWED_DATA_STATUSES = {
     "demo",
     "verified",
 }
+
+NIDDK_PDF_NAME = "NIDDK_CKD_Overview.pdf"
+NIDDK_TITLE = "NIDDK Chronic Kidney Disease Overview"
+NIDDK_SOURCE = (
+    "National Institute of Diabetes and Digestive and Kidney Diseases (NIDDK)"
+)
+NIDDK_URL = (
+    "https://www.niddk.nih.gov/health-information/kidney-disease/"
+    "chronic-kidney-disease-ckd"
+)
 
 
 @dataclass(slots=True)
@@ -70,7 +80,6 @@ def normalize_text(text: str) -> str:
 def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
     """Parse simple Markdown front matter; this is not a full YAML parser."""
     match = FRONT_MATTER_RE.match(text)
-
     if not match:
         return {}, text
 
@@ -106,13 +115,13 @@ def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
 
 
 def document_id_for(path: Path, text: str) -> str:
-    """Create a stable ID from a filename and normalized document content."""
+    """Create a stable document ID from the filename and document content."""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
     return f"{path.stem}-{digest}"
 
 
 class BaseLoader(ABC):
-    """Base interface for supported file loaders."""
+    """Interface for loaders that support particular file extensions."""
 
     extensions: tuple[str, ...] = ()
 
@@ -121,7 +130,7 @@ class BaseLoader(ABC):
 
     @abstractmethod
     def load_text(self, path: Path) -> str:
-        """Read a file and return its text."""
+        """Read a file and return its raw text."""
 
 
 class TextLoader(BaseLoader):
@@ -171,7 +180,7 @@ DEFAULT_LOADERS: tuple[BaseLoader, ...] = (
 
 
 def _first_heading(text: str) -> str | None:
-    """Return the first Markdown heading near the start of a document."""
+    """Return the first Markdown heading near the beginning, if present."""
     for line in text.splitlines():
         stripped = line.strip()
 
@@ -187,7 +196,7 @@ def _first_heading(text: str) -> str | None:
 
 
 def _safe_data_status(value: Any, path: Path) -> str:
-    """Normalize provenance status; unknown or invalid values stay unverified."""
+    """Validate provenance status; unknown values remain unverified."""
     if not isinstance(value, str):
         return "unverified"
 
@@ -204,6 +213,26 @@ def _safe_data_status(value: Any, path: Path) -> str:
     return status
 
 
+def _add_known_source_metadata(
+    path: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Add known source details without overwriting explicitly supplied values.
+
+    The NIDDK status is deliberately left unverified by default. After checking
+    that this PDF genuinely came from the official NIDDK page, you may set its
+    data_status to "verified" in this mapping.
+    """
+    if path.name.casefold() == NIDDK_PDF_NAME.casefold():
+        metadata.setdefault("title", NIDDK_TITLE)
+        metadata.setdefault("source", NIDDK_SOURCE)
+        metadata.setdefault("url", NIDDK_URL)
+        metadata.setdefault("document_type", "public_health_reference")
+        metadata.setdefault("data_status", "unverified")
+
+    return metadata
+
+
 def load_document(
     path: Path,
     loaders: Iterable[BaseLoader] = DEFAULT_LOADERS,
@@ -212,7 +241,7 @@ def load_document(
     loader = next((item for item in loaders if item.can_load(path)), None)
 
     if loader is None:
-        logger.debug("No loader available for %s", path)
+        logger.debug("No loader available for %s", path.name)
         return None
 
     try:
@@ -222,10 +251,15 @@ def load_document(
         return None
 
     metadata, body = parse_front_matter(raw_text)
+    metadata = _add_known_source_metadata(path, metadata)
     body = normalize_text(body)
 
     if not body:
-        logger.warning("Skipping empty or unreadable document: %s", path.name)
+        logger.warning(
+            "Skipping empty document: %s. The PDF may contain scanned pages "
+            "that require OCR.",
+            path.name,
+        )
         return None
 
     known_metadata = {
@@ -238,24 +272,8 @@ def load_document(
         "data_status",
     }
 
-    # PDFs without front matter receive useful display metadata from their filename.
-    default_title = _first_heading(body) or path.stem.replace("_", " ")
-    title = metadata.get("title") or default_title
-
-    default_source = (
-        "NIDDK"
-        if "niddk" in path.stem.lower()
-        else "local corpus"
-    )
-
-    source = metadata.get("source") or default_source
-
-    url = metadata.get("url")
-    if not url and "niddk" in path.stem.lower():
-        url = (
-            "https://www.niddk.nih.gov/health-information/"
-            "kidney-disease/chronic-kidney-disease-ckd"
-        )
+    title = metadata.get("title") or _first_heading(body) or path.stem
+    source = metadata.get("source") or "local corpus"
 
     return RawDocument(
         document_id=document_id_for(path, body),
@@ -263,22 +281,10 @@ def load_document(
         path=path,
         title=str(title),
         source=str(source),
-        url=str(url) if url else None,
-        publication_date=(
-            str(metadata["publication_date"])
-            if metadata.get("publication_date")
-            else None
-        ),
-        document_type=(
-            str(metadata["document_type"])
-            if metadata.get("document_type")
-            else ("PDF" if path.suffix.lower() == ".pdf" else path.suffix.lower())
-        ),
-        evidence_level=(
-            str(metadata["evidence_level"])
-            if metadata.get("evidence_level")
-            else None
-        ),
+        url=metadata.get("url"),
+        publication_date=metadata.get("publication_date"),
+        document_type=metadata.get("document_type"),
+        evidence_level=metadata.get("evidence_level"),
         data_status=_safe_data_status(
             metadata.get("data_status", "unverified"),
             path,
@@ -315,15 +321,9 @@ def collect_documents(
         if document is not None:
             documents.append(document)
 
-    logger.info("Collected %d document(s) from %s", len(documents), directory)
-
-    for document in documents:
-        logger.info(
-            "Loaded source: title=%s, source=%s, status=%s, id=%s",
-            document.title,
-            document.source,
-            document.data_status,
-            document.document_id,
-        )
-
+    logger.info(
+        "Collected %d document(s) from %s",
+        len(documents),
+        directory,
+    )
     return documents
